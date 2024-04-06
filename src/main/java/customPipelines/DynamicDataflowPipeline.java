@@ -1,6 +1,8 @@
 package customPipelines;
 
 import com.google.api.services.bigquery.model.TableRow;
+import com.google.cloud.bigquery.BigQueryOptions;
+import com.google.cloud.bigquery.StandardSQLTypeName;
 import com.google.cloud.bigquery.*;
 import com.google.common.collect.Sets;
 import com.google.gson.Gson;
@@ -8,10 +10,7 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import io.github.cdimascio.dotenv.Dotenv;
 import org.apache.beam.sdk.Pipeline;
-import org.apache.beam.sdk.io.gcp.bigquery.BigQueryIO;
-import org.apache.beam.sdk.io.gcp.bigquery.BigQueryInsertError;
-import org.apache.beam.sdk.io.gcp.bigquery.InsertRetryPolicy;
-import org.apache.beam.sdk.io.gcp.bigquery.TableDestination;
+import org.apache.beam.sdk.io.gcp.bigquery.*;
 import org.apache.beam.sdk.io.gcp.pubsub.PubsubIO;
 import org.apache.beam.sdk.io.gcp.pubsub.PubsubMessage;
 import org.apache.beam.sdk.options.Default;
@@ -20,11 +19,11 @@ import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.apache.beam.sdk.transforms.DoFn;
 import org.apache.beam.sdk.transforms.ParDo;
 import org.apache.beam.sdk.values.*;
+import org.joda.time.Duration;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.sql.Timestamp;
 import java.text.DateFormat;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
@@ -45,6 +44,8 @@ public class DynamicDataflowPipeline {
     static final TupleTag<String> modifyTable = new TupleTag<String>(){};
     static final TupleTag<String> invalidCategory = new TupleTag<String>(){};
 
+    static LRUCache<TableId, Schema> cache = new LRUCache<>(50);
+
     static HashMap<Class<?>, StandardSQLTypeName> typeMapping = new HashMap<>();
 
     static {
@@ -56,7 +57,6 @@ public class DynamicDataflowPipeline {
         typeMapping.put(java.sql.Timestamp.class, StandardSQLTypeName.TIMESTAMP);
         typeMapping.put(ArrayList.class, StandardSQLTypeName.ARRAY);
     }
-
 
     private static final Logger LOG = LoggerFactory.getLogger(DynamicDataflowPipeline.class);
 
@@ -148,16 +148,37 @@ public class DynamicDataflowPipeline {
                                 String message = context.element();
                                 String tableName = HelperFunctions.extractTableName(message);
                                 /*if (true) {*/ // testing
-                                if (!HelperFunctions.doesTableExist(activeProjectId, activeDatasetId, tableName)) {
-                                    context.output(createTable, message);
+                                // if table exists in Cache
+                                boolean isTableInCache = HelperFunctions.doesTableExistInCache(TableId.of(activeDatasetId, tableName));
+                                boolean tableExists;
+
+                                if (isTableInCache) {
+                                    System.out.println("Table: " + tableName + " found in  Cache"); // change to debug log
+                                    tableExists = true;
+                                } else {
+                                    LOG.info("Table: " + tableName + " NOT found in Cache, checking BQ");
+                                    // if table exists in BQ
+                                    tableExists = HelperFunctions.doesTableExist(activeProjectId, activeDatasetId, tableName);
+
+                                    // if true add table to cache
+                                    if (tableExists) {
+                                        BigQuery bigquery = BigQueryOptions.getDefaultInstance().getService();
+                                        Table table = bigquery.getTable(TableId.of(activeDatasetId, tableName));
+                                        Schema schemaFromBigQuery = HelperFunctions.getTableSchema(table);
+
+                                        cache.put(TableId.of(activeDatasetId, tableName), schemaFromBigQuery);
+                                        LOG.info("Table: " + tableName + " exists in BQ and added to Cache, no need to create");
+                                    }
                                 }
 
-                                if (HelperFunctions.doesTableExist(activeProjectId, activeDatasetId, tableName)) {
-                                    // consider adding table name to data here
+                                if (tableExists) {
                                     JsonObject data = HelperFunctions.convertPubsubtoJsonObject(message);
+                                    // consider adding table name to data here
                                     data = HelperFunctions.addTableName(data);
                                     // context.output(insertTable, message);
                                     context.output(insertTable, data.toString());
+                                } else {
+                                    context.output(createTable, message);
                                 }
                             }
                         }).withOutputTags(insertTable, TupleTagList.of(createTable))
@@ -177,7 +198,6 @@ public class DynamicDataflowPipeline {
                             String tableName = jsonMessage.get("table_name").getAsString();
 
                             // System.out.println("table name from jsonMessage: " + tableName); // change to debug logging
-
                             jsonData.addProperty("table_name", tableName);
 
                             // generate table schema using the message body
@@ -200,8 +220,12 @@ public class DynamicDataflowPipeline {
                                     LOG.warn("Table " + tableId.toString() + " already exists");
                                 } else {
                                     bigquery.create(tableInfo); // gets response 409, table already exists if block to help with that
+                                    cache.put(tableId, eventSchema);
+                                    LOG.info("Table: " + tableName + " created and added to Cache");
                                 }
-                                System.out.println("Created Table: " + tableName); // change to debug logging
+                                // System.out.println("Created Table: " + tableName); // change to debug logging
+                                LOG.info("Current table(s) in cache: " + cache);
+                                LOG.info("Current cache size is: " + cache.size());
                             } catch (BigQueryException bq) {
                                 LOG.warn("BigQueryException Encountered in Create Table Step: ", bq);
                             }
@@ -247,12 +271,15 @@ public class DynamicDataflowPipeline {
                                 );
                                 return fullTableDest;
                             })
-                            .withMethod(BigQueryIO.Write.Method.STREAMING_INSERTS)
+                            //.withMethod(BigQueryIO.Write.Method.STREAMING_INSERTS)
+                            .withMethod(BigQueryIO.Write.Method.STORAGE_WRITE_API)
+                            .withTriggeringFrequency(Duration.standardSeconds(5)) // when it needs to be available for reads on BQ
+                            .withNumStorageWriteApiStreams(5)
                             .withCreateDisposition(BigQueryIO.Write.CreateDisposition.CREATE_NEVER)
                             .withFailedInsertRetryPolicy(InsertRetryPolicy.retryTransientErrors())
                             .withWriteDisposition(BigQueryIO.Write.WriteDisposition.WRITE_APPEND)
                             .withoutValidation()
-          //                  .withTriggeringFrequency(Duration.standardDays(1))
+                            //.withTriggeringFrequency(Duration.standardDays(1))
             );
 
         PCollectionTuple modifyOrInsert = branches.get(insertTable).apply(
@@ -278,23 +305,22 @@ public class DynamicDataflowPipeline {
                         // TableId tableId = TableId.of(projectId, activeDatasetId, tableName); // getting "java.lang.NullPointerException com.google.common.base.Preconditions.checkNotNull" when deployed
                         TableId tableId = TableId.of(activeDatasetId, tableName);
 
-                        Table table = bigquery.getTable(tableId);
-                        Schema schemaFromBigQuery = HelperFunctions.getTableSchema(table);
+                        // Table table = bigquery.getTable(tableId); // moving to the section that needs it, that is, when table is modified
+                        // Schema schemaFromBigQuery = HelperFunctions.getTableSchema(table);
+                        Schema schemaFromBigQuery = cache.get(tableId); // from cache
 
                         HashMap hashMapEvent = HelperFunctions.createHashmapFromJsonObject(elementJson);
                         Schema localSchema = HelperFunctions.createSchemaFromEvent(hashMapEvent);
 
-                        Boolean doesSchemaMatch = localSchema.equals(schemaFromBigQuery);
-                        Boolean isSchemaSubset = schemaFromBigQuery.getFields().containsAll(localSchema.getFields());
+                        boolean doesSchemaMatch = localSchema.equals(schemaFromBigQuery);
+                        boolean isSchemaSubset = schemaFromBigQuery.getFields().containsAll(localSchema.getFields());
 
-                        Boolean didDataTypeChange = false;
-                        Boolean areMoreColumns =  true;
+                        boolean didDataTypeChange = false;
+                        boolean areMoreColumns =  true; /// FIX THIS
 
                         if (doesSchemaMatch || isSchemaSubset) {
                             LOG.debug("Schema from bq: " + schemaFromBigQuery);
                             LOG.debug("Local Schema  : " + localSchema/*.getFields()*/);
-
-
 
                             // System.out.println("Does Schema match? : " + (localSchema.toString().equals(schemaFromBigQuery.toString())));
                             LOG.debug("Does Schema match? : " + (doesSchemaMatch));
@@ -310,8 +336,7 @@ public class DynamicDataflowPipeline {
                             c.output(invalidCategory, c.element());
                         }
 
-                         if (!doesSchemaMatch && areMoreColumns) {
-
+                         if (!doesSchemaMatch && areMoreColumns && !isSchemaSubset) {
                              // FieldList newColumns = schemaFromBigQuery.getFields();
                              // newColumns.removeAll(localSchema.getFields()); // not working
                              // System.out.println("New Column: " + newColumnSet);
@@ -330,11 +355,17 @@ public class DynamicDataflowPipeline {
 
                                  LOG.info("Complete new schema with new columns: " + newSchema);
 
-                                 // modifu table with the new schema
+                                 // modify table with the new schema
+                                 Table table = bigquery.getTable(tableId);
                                  Table updatedTable =
                                          table.toBuilder().setDefinition(StandardTableDefinition.of(newSchema)).build();
                                  updatedTable.update();
                                  System.out.println("New column(s) successfully added to table");
+                                 // Update cache
+                                 cache.replace(tableId, newSchema);
+                                 LOG.info("Cache update for Table: " + tableName);
+
+                                 // CAVEAT
                                  // if one column fails then no column is added. A simple case would be when a field is detected as a new column because it has a different datatype.
                                  // it fails because the fields must have unique names, present fields are not overwritten for data integrity
                                  // so other fields are not added. EVEN WITH IMPLICIT CONVERT AT BQ end.
@@ -368,7 +399,7 @@ public class DynamicDataflowPipeline {
                         }
                     }
                 })
-        ).apply(
+        )/*.apply(
                 "DirectInsertToBQ",
                 BigQueryIO.writeTableRows()
                         .to((ValueInSingleWindow<TableRow> event) -> {
@@ -377,7 +408,7 @@ public class DynamicDataflowPipeline {
                             System.out.println("direct insert table_dest: " + tableDest);
 
                             // why the  hell is projectId null?
-//                            TableReference tableRef = new TableReference(activeProjectId, activeDatasetId, tableDest);
+                            // TableReference tableRef = new TableReference(activeProjectId, activeDatasetId, tableDest);
                             TableDestination fullTableDest = new TableDestination(
                                     String.format("%s.%s.%s", activeProjectId, activeDatasetId, tableDest),
                                     "nulll"
@@ -392,8 +423,8 @@ public class DynamicDataflowPipeline {
                         .withWriteDisposition(BigQueryIO.Write.WriteDisposition.WRITE_APPEND)
                         .withExtendedErrorInfo()
                         //.withoutValidation()
-                //                  .withTriggeringFrequency(Duration.standardDays(1))
-        ).getFailedInsertsWithErr().apply("DirectInsert-GetFailedInserts", ParDo.of(new DoFn</*TableRow*/BigQueryInsertError, Void>() {
+                        //.withTriggeringFrequency(Duration.standardDays(1))
+        ).getFailedInsertsWithErr().apply("DirectInsert-GetFailedInserts", ParDo.of(new DoFn<*//*TableRow*//*BigQueryInsertError, Void>() {
             @ProcessElement
             public void processElement(final ProcessContext processContext) throws IOException {
                 // System.out.println("Table Row : " + processContext.element().toPrettyString());
@@ -401,7 +432,46 @@ public class DynamicDataflowPipeline {
                 System.out.println("Table Row Error: " + processContext.element().getError());
                 System.out.println("Table Row Error: " + processContext.element().getRow());
             }
+        }));*/
+
+
+        .apply(
+                "DirectInsertToBQ",
+                BigQueryIO.writeTableRows()
+                        .to((ValueInSingleWindow<TableRow> event) -> {
+                            String tableDest;
+                            tableDest = event.getValue().get("table_name").toString();
+                            System.out.println("direct insert table_dest: " + tableDest);
+
+                            // why the  hell is projectId null?
+                            // TableReference tableRef = new TableReference(activeProjectId, activeDatasetId, tableDest);
+                            TableDestination fullTableDest = new TableDestination(
+                                    String.format("%s.%s.%s", activeProjectId, activeDatasetId, tableDest),
+                                    "nulll"
+                            );
+                            LOG.info("direct insert fullTableDest: " + fullTableDest); // remove this later, for debugging
+                            LOG.info("direct insert fullTableSpec: " + fullTableDest.getTableSpec());
+                            return fullTableDest;
+                        })
+                        //.withMethod(BigQueryIO.Write.Method.STREAMING_INSERTS)
+                        .withMethod(BigQueryIO.Write.Method.STORAGE_WRITE_API)
+                        .withTriggeringFrequency(Duration.standardSeconds(5))
+                        .withNumStorageWriteApiStreams(5)
+                        .withCreateDisposition(BigQueryIO.Write.CreateDisposition.CREATE_NEVER)
+                        .withFailedInsertRetryPolicy(InsertRetryPolicy.retryTransientErrors())
+                        .withWriteDisposition(BigQueryIO.Write.WriteDisposition.WRITE_APPEND)
+                        .withExtendedErrorInfo()
+        ).getFailedStorageApiInserts().apply("DirectInsert-GetFailedInserts", ParDo.of(new DoFn</*TableRow*/BigQueryStorageApiInsertError, Void>() {
+            @ProcessElement
+            public void processElement(final ProcessContext processContext) throws IOException {
+                System.out.println("Table Row : " + processContext.element().toString());
+                System.out.println("Table Row Error: " + processContext.element().getRow());
+
+                LOG.error("(DirectInsert Insert) BQ insert error: " + processContext.element().getErrorMessage());
+                LOG.error("(DirectInsert Insert) Invalid data: " + processContext.element().getRow());
+            }
         }));
+
 
 
         modifyOrInsert.get(modifyTable).apply(
@@ -413,7 +483,7 @@ public class DynamicDataflowPipeline {
                             Gson gson = new Gson();
                             String message = c.element();
                             TableRow row = gson.fromJson(message, TableRow.class);
-                            System.out.println("data type: " + row.getClass() + "\ndata: " + row.toString());
+                            System.out.println("data type: " + row.getClass() + "\ndata: " + row);
                             c.output(row);
                         } catch (Exception e) {
                             System.out.println("Exception in Convert to BQRow step: " + e);
@@ -505,6 +575,10 @@ public class DynamicDataflowPipeline {
             return doesExist;
         }
 
+        static private boolean doesTableExistInCache(TableId tableId) {
+            return cache.containsKey(tableId);
+        }
+
         static private String extractTableName(String message) { // input is String
             String tableName = "";
 
@@ -544,49 +618,48 @@ public class DynamicDataflowPipeline {
         }
 
         // cant use because it parses everything as a string. getClass() on each value misleading
-        static private Schema createSchemaFromJsonEvent(JsonObject messageData) throws ParseException {
-            List<String> keyList = new ArrayList<>(messageData.keySet());
-            List<Field> fieldList = new ArrayList<>();
-
-            System.out.println(keyList.toString());
-            for (String fieldName : keyList) {
-                // String fieldName = key;
-                Object value = messageData.get(fieldName);
-                System.out.println(String.format("Field name: %s Field value: %s field type: %s", fieldName, value.toString(), value.getClass()));
-                if (fieldName.contains("time")) {
-                    DateFormat formatter = new SimpleDateFormat("dd-MM-yyyy HH:mm:ss.SSS");
-                    Date date = formatter.parse((String) value);
-
-                    Timestamp timeStampDate = new Timestamp(date.getTime());
-                     System.out.println("Field name: " + fieldName + ", Detected Field type: " + (timeStampDate).getClass());
-                    StandardSQLTypeName fieldType = com.google.cloud.bigquery.StandardSQLTypeName.TIMESTAMP; //getFieldType(value);
-
-                    Field field = Field.newBuilder(fieldName, fieldType).setMode(Field.Mode.NULLABLE).build();
-                    fieldList.add(field);
-                    continue;
-                }
-
-                if (value.getClass() == ArrayList.class) {
-                     System.out.println("Field name: " + fieldName + ", Detected Field type: " + (value).getClass());
-                    StandardSQLTypeName fieldType = typeMapping.get(((ArrayList<?>) value).get(0).getClass());
-                     System.out.println("Mapped Field type: " + fieldType.toString());
-                    Field field = Field.newBuilder(fieldName, fieldType).setMode(Field.Mode.REPEATED).build();
-                    fieldList.add(field);
-                    continue;
-                }
-
-                // System.out.println("Field name: " + fieldName + ", Detected Field type: " + value.getClass());
-                // StandardSQLTypeName fieldType = com.google.cloud.bigquery.StandardSQLTypeName.STRING; //getFieldType(value);
-                StandardSQLTypeName fieldType = typeMapping.get(value.getClass());
-                Field field = Field.newBuilder(fieldName, fieldType).setMode(Field.Mode.NULLABLE).build();
-                fieldList.add(field);
-            }
-
-
-            Schema schema = Schema.of(fieldList);
-
-            return schema;
-        }
+//        static private Schema createSchemaFromJsonEvent(JsonObject messageData) throws ParseException {
+//            List<String> keyList = new ArrayList<>(messageData.keySet());
+//            List<Field> fieldList = new ArrayList<>();
+//
+//            System.out.println(keyList.toString());
+//            for (String fieldName : keyList) {
+//                // String fieldName = key;
+//                Object value = messageData.get(fieldName);
+//                System.out.println(String.format("Field name: %s Field value: %s field type: %s", fieldName, value.toString(), value.getClass()));
+//                if (fieldName.contains("time")) {
+//                    DateFormat formatter = new SimpleDateFormat("dd-MM-yyyy HH:mm:ss.SSS");
+//                    Date date = formatter.parse((String) value);
+//
+//                    Timestamp timeStampDate = new Timestamp(date.getTime());
+//                     System.out.println("Field name: " + fieldName + ", Detected Field type: " + (timeStampDate).getClass());
+//                    StandardSQLTypeName fieldType = com.google.cloud.bigquery.StandardSQLTypeName.TIMESTAMP; //getFieldType(value);
+//
+//                    Field field = Field.newBuilder(fieldName, fieldType).setMode(Field.Mode.NULLABLE).build();
+//                    fieldList.add(field);
+//                    continue;
+//                }
+//
+//                if (value.getClass() == ArrayList.class) {
+//                     System.out.println("Field name: " + fieldName + ", Detected Field type: " + (value).getClass());
+//                    StandardSQLTypeName fieldType = typeMapping.get(((ArrayList<?>) value).get(0).getClass());
+//                     System.out.println("Mapped Field type: " + fieldType.toString());
+//                    Field field = Field.newBuilder(fieldName, fieldType).setMode(Field.Mode.REPEATED).build();
+//                    fieldList.add(field);
+//                    continue;
+//                }
+//
+//                // System.out.println("Field name: " + fieldName + ", Detected Field type: " + value.getClass());
+//                // StandardSQLTypeName fieldType = com.google.cloud.bigquery.StandardSQLTypeName.STRING; //getFieldType(value);
+//                StandardSQLTypeName fieldType = typeMapping.get(value.getClass());
+//                Field field = Field.newBuilder(fieldName, fieldType).setMode(Field.Mode.NULLABLE).build();
+//                fieldList.add(field);
+//            }
+//
+//            Schema schema = Schema.of(fieldList);
+//
+//            return schema;
+//        }
         static private Schema createSchemaFromEvent(/*LinkedTreeMap*/ HashMap messageData) throws ParseException {
             List<String> keyList = new ArrayList<>(messageData.keySet());
             List<Field> fieldList = new ArrayList<>();
@@ -597,7 +670,6 @@ public class DynamicDataflowPipeline {
                 if (fieldName.contains("time")) {
                     DateFormat formatter = new SimpleDateFormat("dd-MM-yyyy HH:mm:ss.SSS");
                     Date date = formatter.parse((String) value);
-
 
                     // System.out.println("Field name: " + fieldName + ", Detected Field type: " + (timeStampDate).getClass());
                     StandardSQLTypeName fieldType = com.google.cloud.bigquery.StandardSQLTypeName.TIMESTAMP; //getFieldType(value);
@@ -630,6 +702,21 @@ public class DynamicDataflowPipeline {
         }
     }
 
+    // Caching (LRU)
+    public static class LRUCache<K, V> extends LinkedHashMap<K, V> {
+        private final int capacity;
+
+        public LRUCache(int capacity) {
+            super(capacity, 0.75f, true);
+            this.capacity = capacity;
+        }
+
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<K, V> eldest) {
+            return size() > this.capacity;
+        }
+    }
+
 //        static class Branch extends /*DoFn<PubsubMessage, KV<PubsubMessage, String>>*/  DoFn<String, String> {
 //
 //            @ProcessElement
@@ -658,6 +745,11 @@ public class DynamicDataflowPipeline {
 
 }
 
+/*
+* ASSUMPTIONS
+* All ingestion is to the same dataset in Bigquery
+* All ingestion is to the same project on GCP
+* */
 
 /*
 * Other General ideas
@@ -670,4 +762,21 @@ public class DynamicDataflowPipeline {
 *   - Consider using flatten to merge the output of ModifyTableConvertToTableRow and DirectInsertConvertToTableRow - https://beam.apache.org/documentation/transforms/java/other/flatten/
 *       because, I should be able to use the same BigQueryWriteIO DoFn and errorHandling after merging
 * 3. Duplicates at the beginning, when there is a flurry of events.... FIX IT
+* */
+
+/*
+* ISSUES
+* 1. Running into Exceeded Rate limit
+*   Possible cause:
+*       When checking if table exists, it makes an api call and there is api limiting
+*       Currently (Apr 6,2024), the workflow is to check that the table exists for each event, not sustainable I guess, if it does not exist, create the table but if it does, insert or modify table
+*       SOLUTION IDEA: (DONE-ISH, need to test the limits of the cache, e.g. what happens when it is full or at capacity)
+*       https://www.linkedin.com/pulse/building-lru-cache-java-simple-approach-using-weberton-faria-0cglc#:~:text=The%20LRU%20Cache%20can%20be,abstracted%20using%20the%20LinkedHashMap%20class.
+*           Implement caching: when a table is created, it stores the table definition in a map like object (cache), instead of checking BigQuery itself, we check the cache, then bigquery
+*           if the table is not found then create the table and store in the cache.
+*
+* 2. too much logging...smh
+*   SOLUTION IDEA:
+*       Remove logging (any level lower than WARNING - INFO, DEBUG, DEFAULT and friends) than for direct insert, most of the workload is there anyway.
+*       or change to debug, the minimum level seems to be info anyway 🤷‍♂️
 * */
