@@ -126,7 +126,8 @@ public class DynamicDataflowPipeline {
          *
          *
          */
-        PCollection<PubsubMessage> messages = p.apply("ReadFromPubSub", PubsubIO.readMessagesWithAttributes().fromSubscription(fullSubcriptionName));
+        // adding ".withIdAttribute("event_id")" to pubsub.io.read for deduplication and exactly once delivery
+        PCollection<PubsubMessage> messages = p.apply("ReadFromPubSub", PubsubIO.readMessagesWithAttributes().fromSubscription(fullSubcriptionName).withIdAttribute("event_id"));
 
         PCollectionTuple branches = messages
                 .apply(
@@ -301,7 +302,7 @@ public class DynamicDataflowPipeline {
                         String element = c.element();
                         JsonObject elementJson = HelperFunctions.convertPubsubtoJsonObject(element);
                         String tableName = elementJson.get("table_name").getAsString();
-                        LOG.info("before getting tableID: " + tableName + " projectid: " + activeProjectId + " dataset: " + activeDatasetId);
+                        LOG.debug("before getting tableID: " + tableName + " projectid: " + activeProjectId + " dataset: " + activeDatasetId);
                         // TableId tableId = TableId.of(projectId, activeDatasetId, tableName); // getting "java.lang.NullPointerException com.google.common.base.Preconditions.checkNotNull" when deployed
                         TableId tableId = TableId.of(activeDatasetId, tableName);
 
@@ -391,7 +392,7 @@ public class DynamicDataflowPipeline {
                             Gson gson = new Gson();
                             String message = c.element();
                             TableRow row = gson.fromJson(message, TableRow.class);
-                            System.out.println("data type: " + row.getClass() + "\ndata: " + row.toString());
+                            // System.out.println("data type: " + row.getClass() + "\ndata: " + row.toString());
                             c.output(row);
                         } catch (Exception e) {
                             System.out.println("Exception in Convert to BQRow step: " + e);
@@ -441,7 +442,7 @@ public class DynamicDataflowPipeline {
                         .to((ValueInSingleWindow<TableRow> event) -> {
                             String tableDest;
                             tableDest = event.getValue().get("table_name").toString();
-                            System.out.println("direct insert table_dest: " + tableDest);
+                            // System.out.println("direct insert table_dest: " + tableDest);
 
                             // why the  hell is projectId null?
                             // TableReference tableRef = new TableReference(activeProjectId, activeDatasetId, tableDest);
@@ -449,8 +450,8 @@ public class DynamicDataflowPipeline {
                                     String.format("%s.%s.%s", activeProjectId, activeDatasetId, tableDest),
                                     "nulll"
                             );
-                            LOG.info("direct insert fullTableDest: " + fullTableDest); // remove this later, for debugging
-                            LOG.info("direct insert fullTableSpec: " + fullTableDest.getTableSpec());
+                            LOG.debug("direct insert fullTableDest: " + fullTableDest); // remove this later, for debugging
+                            LOG.debug("direct insert fullTableSpec: " + fullTableDest.getTableSpec());
                             return fullTableDest;
                         })
                         //.withMethod(BigQueryIO.Write.Method.STREAMING_INSERTS)
