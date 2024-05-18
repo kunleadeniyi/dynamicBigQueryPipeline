@@ -313,6 +313,10 @@ public class DynamicDataflowPipeline {
                         HashMap hashMapEvent = HelperFunctions.createHashmapFromJsonObject(elementJson);
                         Schema localSchema = HelperFunctions.createSchemaFromEvent(hashMapEvent);
 
+                        /*
+                        * consider using the getFields() method because of data masking/policy implementation
+                        * column level policy implementation are a modification of the schema sub field {policyTags=null}
+                        * to {policyTags=something else}, getfields() might help, idk yet*/
                         boolean doesSchemaMatch = localSchema.equals(schemaFromBigQuery);
                         boolean isSchemaSubset = schemaFromBigQuery.getFields().containsAll(localSchema.getFields());
 
@@ -344,29 +348,59 @@ public class DynamicDataflowPipeline {
                              try {
                                  Set<Field> fromBQ = new HashSet<>(schemaFromBigQuery.getFields());
                                  Set<Field> fromLocal = new HashSet<>(localSchema.getFields());
-                                 Set<Field> newColumnSet = Sets.difference(fromLocal, fromBQ); // the order matters
+                                 Set<Field> newColumnSet = new HashSet<>(Sets.difference(fromLocal, fromBQ)); // the argument order matters //HashSet is to make it mutable
 
-                                 LOG.debug("local schema: " + localSchema.getFields());
-                                 LOG.debug("new fields: " + newColumnSet);
-                                 // Create a new schema adding the current fields, plus the new one
-                                 List<Field> fieldList = new ArrayList<Field>(schemaFromBigQuery.getFields());
-                                 fieldList.addAll(newColumnSet);
-                                 LOG.debug("new fields list: " + fieldList);
-                                 Schema newSchema = Schema.of(fieldList);
+                                 LOG.info("local schema: " + localSchema.getFields());
+                                 LOG.info("new fields: " + newColumnSet);
+                                 // find schema policy changes and update schema in cache
 
-                                 LOG.info("Complete new schema with new columns: " + newSchema);
+                                 // I have to update in place, can't think of another way for now
+                                 // naive implementation, wicked for loop in a for loop
+                                 List<Field> mutableSchemaFromBigQuery = new ArrayList<>(schemaFromBigQuery.getFields());
+                                 List<Field> fieldsWithPolicyTags =  new ArrayList<>();
+                                 for (Field newField : newColumnSet) {
+                                     for (Field field : mutableSchemaFromBigQuery) {
+                                         if (field.getName().equals(newField.getName()) && (field.getPolicyTags() != null)) {
+                                             int fieldIndex = schemaFromBigQuery.getFields().getIndex(newField.getName()); //
+                                             LOG.debug("Field Index is: "+ fieldIndex);
 
-                                 // modify table with the new schema
-                                 Table table = bigquery.getTable(tableId);
-                                 Table updatedTable =
-                                         table.toBuilder().setDefinition(StandardTableDefinition.of(newSchema)).build();
-                                 updatedTable.update();
-                                 System.out.println("New column(s) successfully added to table");
-                                 // Update cache
-                                 cache.replace(tableId, newSchema);
-                                 LOG.info("Cache update for Table: " + tableName);
+                                             mutableSchemaFromBigQuery.set(fieldIndex, newField);
+                                             //schemaFromBigQuery.getFields().set(fieldIndex, replacement); // not working - Unsupported Operation
+                                             fieldsWithPolicyTags.add(newField);
+                                         }
+                                     }
 
+                                     LOG.info("policy tags don't match, modifying cache schema to ignore policy changes in schema");
+                                     LOG.debug("Cache before: " + cache.get(tableId));
+                                     cache.replace(tableId, Schema.of(FieldList.of(mutableSchemaFromBigQuery))); // I need to set that field to null instead of this.
+                                     LOG.debug("Cache after: " + cache.get(tableId));
+                                 }
+
+                                 LOG.debug("Column Set count: " + newColumnSet.size());
+                                 fieldsWithPolicyTags.forEach(newColumnSet::remove); // same thing as - newColumnSet.removeAll(fieldsWithPolicyTags);
+                                 LOG.debug("Column Set count after removing fields with Tags: " + newColumnSet.size());
+
+                                 if (!newColumnSet.isEmpty()) { // only necessary if there are still new columns
+                                     // Create a new schema adding the current fields, plus the new one
+                                     List<Field> fieldList = new ArrayList<Field>(schemaFromBigQuery.getFields());
+                                     fieldList.addAll(newColumnSet);
+                                     LOG.info("new fields list: " + fieldList);
+                                     Schema newSchema = Schema.of(fieldList);
+
+                                     LOG.info("Complete new schema with new columns: " + newSchema);
+
+                                     // modify table with the new schema
+                                     Table table = bigquery.getTable(tableId);
+                                     Table updatedTable =
+                                             table.toBuilder().setDefinition(StandardTableDefinition.of(newSchema)).build();
+                                     updatedTable.update();
+                                     System.out.println("New column(s) successfully added to table");
+                                     // Update cache
+                                     cache.replace(tableId, newSchema);
+                                     LOG.info("Cache update for Table: " + tableName);
+                                 }
                                  // CAVEAT
+                                 // modifying the schema is an expensive operation and automatic changes must be infrequent.
                                  // if one column fails then no column is added. A simple case would be when a field is detected as a new column because it has a different datatype.
                                  // it fails because the fields must have unique names, present fields are not overwritten for data integrity
                                  // so other fields are not added. EVEN WITH IMPLICIT CONVERT AT BQ end.
@@ -484,10 +518,10 @@ public class DynamicDataflowPipeline {
                             Gson gson = new Gson();
                             String message = c.element();
                             TableRow row = gson.fromJson(message, TableRow.class);
-                            System.out.println("data type: " + row.getClass() + "\ndata: " + row);
+                            System.out.println("Step: ModifyTable Insert/Convert to Table Row \ndata type: " + row.getClass() + "\ndata: " + row); // change to logging event
                             c.output(row);
                         } catch (Exception e) {
-                            System.out.println("Exception in Convert to BQRow step: " + e);
+                            System.out.println("Exception in Convert to BQRow step: " + e); // change to error/exception logging event
                             e.printStackTrace();
                         }
                     }
@@ -780,4 +814,10 @@ public class DynamicDataflowPipeline {
 *   SOLUTION IDEA:
 *       Remove logging (any level lower than WARNING - INFO, DEBUG, DEFAULT and friends) than for direct insert, most of the workload is there anyway.
 *       or change to debug, the minimum level seems to be info anyway 🤷‍♂️
+*
+* 3. Ignoring policy changes. EG. Data masking policies with modify the schema of the table and the schema validation will always fail and go into modifyTable branch when it should not
+*   SOLUTION: (DONE, I think it can be optimized) - may need to verify that the field data type is also not overwritten, when cache is updated for policy tag cases.
+*       Use the cache to keep the copy of the schema where the policy tag is null.
+*       If the job is restarted, the cache will assume the schema in BQ which has the policy tag,
+*           in this case update the policy tag in place to null and replace the schema in cache with the one that has policy tags set to null
 * */
